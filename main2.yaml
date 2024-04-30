@@ -130,24 +130,6 @@ Resources:
               - Effect: Allow
                 Action: ec2:*
                 Resource: '*'
-              - Effect: Allow
-                Action: eks:*
-                Resource: !GetAtt MyEKSCluster.Arn
-              - Effect: Allow
-                Action:
-                  - iam:GetOpenIDConnectProvider
-                  - iam:CreateOpenIDConnectProvider
-                  - iam:TagOpenIDConnectProvider
-                  - iam:CreatePolicy
-                  - cloudformation:ListStacks
-                  - cloudformation:CreateStack
-                  - iam:CreateRole
-                  - iam:DetachRolePolicy
-                  - iam:DeleteRole
-                  - iam:TagRole
-                  - iam:AttachRolePolicy
-                  - iam:GetRole
-                Resource: '*'
 
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -218,7 +200,6 @@ Resources:
           echo "0 0 * * * /usr/local/bin/mongo_backups.sh" >> crontab_new
           crontab crontab_new
           rm crontab_new
-
 
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
@@ -317,6 +298,7 @@ Resources:
         - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
       Policies:
+          # This is needed for the AWS Load Balancer Controller
         - PolicyName: NodeInstanceELBPolicy
           PolicyDocument:
             Version: '2012-10-17'
@@ -339,6 +321,7 @@ Resources:
           - !Ref PrivateSubnet2
         SecurityGroupIds:
           - !Ref MySecurityGroup
+      # This is needed for initial access for a user on the Mongo EC2.
       AccessConfig:
         AuthenticationMode: API_AND_CONFIG_MAP
 
@@ -360,6 +343,35 @@ Resources:
     DependsOn: 
       - PrivateSubnetRouteAssociation1
       - PrivateSubnetRouteAssociation2
+
+  KubeAdmin:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: kube-admin
+      Policies:
+        - PolicyName: kube-admin-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: eks:*
+                Resource: !GetAtt MyEKSCluster.Arn
+              - Effect: Allow
+                # This is all needed to deploy the AWS Load Balancer Controller
+                Action:
+                  - cloudformation:ListStacks
+                  - cloudformation:CreateStack
+                  - iam:GetOpenIDConnectProvider
+                  - iam:CreateOpenIDConnectProvider
+                  - iam:TagOpenIDConnectProvider
+                  - iam:CreatePolicy
+                  - iam:CreateRole
+                  - iam:DetachRolePolicy
+                  - iam:DeleteRole
+                  - iam:TagRole
+                  - iam:AttachRolePolicy
+                  - iam:GetRole
+                Resource: '*'
 
 Outputs:
   EKSClusterName:
