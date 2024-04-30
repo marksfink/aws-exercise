@@ -1,5 +1,5 @@
 #!/bin/bash
-source ~/.mongodb/mongo_backups
+source /home/bitnami/.mongodb/mongo_backups
 
 MONGO_CONNECTION_STRING="mongodb://$MONGO_USER:$MONGO_PASS@localhost:27017"
 

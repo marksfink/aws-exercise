@@ -2,15 +2,22 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: Wiz Exercise
 
 Parameters:
+  DeploymentBucketName:
+    Type: String
+    Description: Existing S3 bucket with deployment files
+    Default: fink-exercise-files
+  BackupBucketName:
+    Type: String
+    Description: S3 bucket to create for Mongo backups
+    Default: fink-mongo-backups
   MyKeyPair:
     Type: AWS::EC2::KeyPair::KeyName
     Description: Select the keypair to use for the Mongo EC2
-  MyBucketName:
-    Type: String
-    Description: Enter the name of the S3 bucket to create for Mongo backups
+    Default: mongo
   MongoUser:
     Type: String
     Description: Mongo user for connection string
+    Default: mark
   MongoPassword:
     Type: String
     Description: Mongo password for connection string
@@ -33,9 +40,6 @@ Resources:
     Properties:
       VpcId: !Ref MyVPC
       InternetGatewayId: !Ref MyInternetGateway
-    DependsOn:
-      - MyVPC
-      - MyInternetGateway
 
   PublicSubnet:
     Type: AWS::EC2::Subnet
@@ -47,15 +51,14 @@ Resources:
         - !GetAZs 
           Ref: 'AWS::Region'
       MapPublicIpOnLaunch: true
-    DependsOn: 
-      - MyVPC
+      Tags:
+        - Key: kubernetes.io/role/elb
+          Value: 1
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref MyVPC
-    DependsOn: 
-      - MyVPC
 
   InternetRoute:
     Type: AWS::EC2::Route
@@ -64,37 +67,38 @@ Resources:
       RouteTableId: !Ref PublicRouteTable
       DestinationCidrBlock: "0.0.0.0/0"
       GatewayId: !Ref MyInternetGateway
-    DependsOn: 
-      - PublicRouteTable
-      - MyInternetGateway
 
   SubnetRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
-    DependsOn: 
-      - PublicSubnet
-      - PublicRouteTable
 
   MySecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow SSH access from me only
+      GroupDescription: Allow limited SSH and Mongo from EKS
       VpcId: !Ref MyVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
-          CidrIp: 71.246.13.84/32
-    DependsOn: 
-      - MyVPC
+          CidrIp: 100.34.1.200/32
+        - IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          SourceSecurityGroupId: !GetAtt MyEKSCluster.ClusterSecurityGroupId
 
-  S3Bucket:
+  BackupBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Ref MyBucketName
-# TODO: Configure to be public
+      BucketName: !Ref BackupBucketName
+      AccessControl: 'PublicRead'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
 
   EC2Role:
     Type: AWS::IAM::Role
@@ -107,20 +111,42 @@ Resources:
               Service: ec2.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: S3ReadAccessPolicy
+        - PolicyName: MongoEC2Policy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: s3:GetObject
-                Resource: arn:aws:s3:::fink-mongo-files/*
+                Action: 
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${DeploymentBucketName}
+                  - !Sub arn:aws:s3:::${DeploymentBucketName}/*
               - Effect: Allow
                 Action: s3:*
                 Resource:
-                  - !Sub ${S3Bucket.Arn}
-                  - !Sub ${S3Bucket.Arn}/*
+                  - !Sub ${BackupBucket.Arn}
+                  - !Sub ${BackupBucket.Arn}/*
               - Effect: Allow
                 Action: ec2:*
+                Resource: '*'
+              - Effect: Allow
+                Action: eks:*
+                Resource: !GetAtt MyEKSCluster.Arn
+              - Effect: Allow
+                Action:
+                  - iam:GetOpenIDConnectProvider
+                  - iam:CreateOpenIDConnectProvider
+                  - iam:TagOpenIDConnectProvider
+                  - iam:CreatePolicy
+                  - cloudformation:ListStacks
+                  - cloudformation:CreateStack
+                  - iam:CreateRole
+                  - iam:DetachRolePolicy
+                  - iam:DeleteRole
+                  - iam:TagRole
+                  - iam:AttachRolePolicy
+                  - iam:GetRole
                 Resource: '*'
 
   EC2InstanceProfile:
@@ -128,8 +154,6 @@ Resources:
     Properties:
       Roles:
         - Ref: EC2Role
-    DependsOn:
-      - EC2Role
 
   MongoInstance:
     Type: AWS::EC2::Instance
@@ -147,10 +171,35 @@ Resources:
           apt update
           apt upgrade
 
-          aws s3 cp s3://fink-mongo-files/* /usr/local/bin
+          # Install kubectl
+          apt install -y apt-transport-https ca-certificates curl gpg
+          curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          sudo chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+          sudo chmod 644 /etc/apt/sources.list.d/kubernetes.list
+          apt update
+          apt install -y kubectl
+
+          # Install eksctl
+          PLATFORM=$(uname -s)_amd64
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
+          curl -sL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_checksums.txt" | grep $PLATFORM | sha256sum --check
+          tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp && rm eksctl_$PLATFORM.tar.gz
+          sudo mv /tmp/eksctl /usr/local/bin
+
+          # Install helm
+          curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+          sudo apt-get install apt-transport-https --yes
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+          sudo apt-get update
+          sudo apt-get install helm
+
+          # Download mongo scripts
+          aws s3 sync s3://${DeploymentBucketName} /usr/local/bin --exclude * --include mongo*
           chown root:bitnami /usr/local/bin/*
           chmod 770 /usr/local/bin/*
 
+          # Securely store mongo creds
           mkdir -p /home/bitnami/.mongodb
           chown bitnami:bitnami /home/bitnami/.mongodb
           chmod 770 /home/bitnami/.mongodb
@@ -159,33 +208,76 @@ Resources:
           MONGO_USER=${MongoUser}
           MONGO_PASS=${MongoPassword}
           BACKUP_ROOT_FOLDER=/home/bitnami/backups
-          S3_BUCKET=${S3Bucket}
+          S3_BUCKET=${BackupBucket}
           EOF
           chown bitnami:bitnami /home/bitnami/.mongodb/mongo_backups
           chmod 600 /home/bitnami/.mongodb/mongo_backups
 
+          # Schedule mongo backups
           crontab -l > crontab_new
           echo "0 0 * * * /usr/local/bin/mongo_backups.sh" >> crontab_new
           crontab crontab_new
           rm crontab_new
-    DependsOn:
-      - PublicSubnet
-      - MySecurityGroup
-      - S3Bucket
-      - EC2InstanceProfile
 
 
-  PrivateSubnet:
+  PrivateSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref MyVPC
-      CidrBlock: "10.0.2.0/24"
+      CidrBlock: "10.0.3.0/24"
       AvailabilityZone: !Select
         - 0
         - !GetAZs 
           Ref: 'AWS::Region'
-    DependsOn: 
-      - MyVPC
+      Tags:
+        - Key: kubernetes.io/role/internal-elb
+          Value: 1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: "10.0.4.0/24"
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      Tags:
+        - Key: kubernetes.io/role/internal-elb
+          Value: 1
+
+  MyEIP:
+    Type: AWS::EC2::EIP
+
+  MyNATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt MyEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PrivateSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PrivateSubnetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref MyNATGateway
+
+  PrivateSubnetRouteAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateSubnetRouteTable
+
+  PrivateSubnetRouteAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateSubnetRouteTable
 
   EKSMasterRole:
     Type: AWS::IAM::Role
@@ -224,6 +316,16 @@ Resources:
         - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
         - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Policies:
+        - PolicyName: NodeInstanceELBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:*
+                  - ec2:*
+                Resource: '*'
 
   MyEKSCluster:
     Type: AWS::EKS::Cluster
@@ -233,13 +335,12 @@ Resources:
       RoleArn: !GetAtt EKSMasterRole.Arn
       ResourcesVpcConfig:
         SubnetIds:
-          - !Ref PrivateSubnet
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
         SecurityGroupIds:
           - !Ref MySecurityGroup
-    DependsOn: 
-      - PrivateSubnet
-      - MySecurityGroup
-      - EKSMasterRole
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
 
   MyNodeGroup:
     Type: AWS::EKS::Nodegroup
@@ -247,74 +348,18 @@ Resources:
       ClusterName: !Ref MyEKSCluster
       NodegroupName: my-node-group
       ScalingConfig:
-        DesiredSize: 1
-        MinSize: 1
-        MaxSize: 1
+        DesiredSize: 2
+        MinSize: 2
+        MaxSize: 2
       InstanceTypes:
         - t3a.medium
       NodeRole: !GetAtt NodeInstanceRole.Arn
       Subnets:
-        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
     DependsOn: 
-      - MyEKSCluster
-      - NodeInstanceRole
-      - PrivateSubnet
-
-  MyNLB:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    Properties:
-      Name: my-nlb
-      Scheme: internet-facing
-      Subnets: !Ref PublicSubnet
-      Type: network
-      Tags:
-        - Key: Name
-          Value: my-nlb
-    DependsOn: 
-      - PublicSubnet
-
-  MyTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      HealthCheckIntervalSeconds: 30
-      HealthCheckPath: /
-      HealthCheckProtocol: TCP
-      HealthCheckTimeoutSeconds: 10
-      HealthyThresholdCount: 2
-      Matcher:
-        HttpCode: 200
-      Port: 8080
-      Protocol: TCP
-      TargetType: ip
-      UnhealthyThresholdCount: 2
-      VpcId: !Ref MyVPC
-    DependsOn: 
-      - MyVPC
-
-  MyListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref MyTargetGroup
-      LoadBalancerArn: !Ref MyNLB
-      Port: 50080
-      Protocol: TCP
-    DependsOn: 
-      - MyTargetGroup
-      - MyNLB
-
-  # MyEIP:
-  #   Type: AWS::EC2::EIP
-
-  # MyNATGateway:
-  #   Type: AWS::EC2::NatGateway
-  #   Properties:
-  #     AllocationId: !GetAtt MyEIP.AllocationId
-  #     SubnetId: !Ref PublicSubnet
-  #   DependsOn: 
-  #     - MyEIP
-  #     - PublicSubnet
+      - PrivateSubnetRouteAssociation1
+      - PrivateSubnetRouteAssociation2
 
 Outputs:
   EKSClusterName:
@@ -323,9 +368,6 @@ Outputs:
   EKSClusterEndpoint:
     Description: The endpoint for the EKS cluster
     Value: !GetAtt MyEKSCluster.Endpoint
-  NLBDNSName:
-    Description: The DNS name of the public NLB
-    Value: !GetAtt MyNLB.DNSName
   MongoIP:
     Description: Mongo IP
     Value: !GetAtt MongoInstance.PublicIp
