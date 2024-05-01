@@ -16,11 +16,18 @@ Parameters:
     Default: mongo
   MongoUser:
     Type: String
-    Description: Mongo user for connection string
+    Description: Mongo user for tasky and backups
     Default: mark
   MongoPassword:
     Type: String
-    Description: Mongo password for connection string
+    Description: Mongo password for tasky and backups
+  YourIPAddress:
+    Type: String
+    Description: IP address allowed for SSH traffic.  Be sure to add /32 at the end.
+  EKSClusterName:
+    Type: String
+    Description: EKS Cluster Name
+    Default: my-eks-cluster
 
 # TODO: Pull Mongo creds from Secrets Manager
 
@@ -74,7 +81,7 @@ Resources:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
 
-  MySecurityGroup:
+  MongoSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Allow limited SSH and Mongo from EKS
@@ -83,7 +90,7 @@ Resources:
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
-          CidrIp: 100.34.1.200/32
+          CidrIp: !Ref YourIPAddress
         - IpProtocol: tcp
           FromPort: 27017
           ToPort: 27017
@@ -93,7 +100,6 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Ref BackupBucketName
-      AccessControl: 'PublicRead'
       PublicAccessBlockConfiguration:
         BlockPublicAcls: false
         IgnorePublicAcls: false
@@ -130,24 +136,6 @@ Resources:
               - Effect: Allow
                 Action: ec2:*
                 Resource: '*'
-              - Effect: Allow
-                Action: eks:*
-                Resource: !GetAtt MyEKSCluster.Arn
-              - Effect: Allow
-                Action:
-                  - iam:GetOpenIDConnectProvider
-                  - iam:CreateOpenIDConnectProvider
-                  - iam:TagOpenIDConnectProvider
-                  - iam:CreatePolicy
-                  - cloudformation:ListStacks
-                  - cloudformation:CreateStack
-                  - iam:CreateRole
-                  - iam:DetachRolePolicy
-                  - iam:DeleteRole
-                  - iam:TagRole
-                  - iam:AttachRolePolicy
-                  - iam:GetRole
-                Resource: '*'
 
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -161,7 +149,7 @@ Resources:
       ImageId: ami-050273e9c99f741c6  # Bitnami MongoDB 7.0.9-0 AMI
       InstanceType: t2.micro
       SecurityGroupIds:
-        - !Ref MySecurityGroup
+        - !Ref MongoSecurityGroup
       KeyName: !Ref MyKeyPair
       SubnetId: !Ref PublicSubnet
       IamInstanceProfile: !Ref EC2InstanceProfile
@@ -171,39 +159,17 @@ Resources:
           apt update
           apt upgrade
 
-          # Install kubectl
-          apt install -y apt-transport-https ca-certificates curl gpg
-          curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-          sudo chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-          echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
-          sudo chmod 644 /etc/apt/sources.list.d/kubernetes.list
-          apt update
-          apt install -y kubectl
-
-          # Install eksctl
-          PLATFORM=$(uname -s)_amd64
-          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
-          curl -sL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_checksums.txt" | grep $PLATFORM | sha256sum --check
-          tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp && rm eksctl_$PLATFORM.tar.gz
-          sudo mv /tmp/eksctl /usr/local/bin
-
-          # Install helm
-          curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
-          sudo apt-get install apt-transport-https --yes
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
-          sudo apt-get update
-          sudo apt-get install helm
-
-          # Download mongo scripts
-          aws s3 sync s3://${DeploymentBucketName} /usr/local/bin --exclude * --include mongo*
+          # Download scripts
+          aws s3 sync s3://${DeploymentBucketName} /usr/local/bin
           chown root:bitnami /usr/local/bin/*
           chmod 770 /usr/local/bin/*
 
-          # Securely store mongo creds
+          # Create mongo config directory in home folder
           mkdir -p /home/bitnami/.mongodb
           chown bitnami:bitnami /home/bitnami/.mongodb
           chmod 770 /home/bitnami/.mongodb
 
+          # Securely store mongo user creds for backups
           cat >> /home/bitnami/.mongodb/mongo_backups<< EOF
           MONGO_USER=${MongoUser}
           MONGO_PASS=${MongoPassword}
@@ -213,12 +179,8 @@ Resources:
           chown bitnami:bitnami /home/bitnami/.mongodb/mongo_backups
           chmod 600 /home/bitnami/.mongodb/mongo_backups
 
-          # Schedule mongo backups
-          crontab -l > crontab_new
-          echo "0 0 * * * /usr/local/bin/mongo_backups.sh" >> crontab_new
-          crontab crontab_new
-          rm crontab_new
-
+          # Run remaining config tasks.
+          /usr/local/bin/config.sh
 
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
@@ -317,6 +279,7 @@ Resources:
         - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
       Policies:
+          # This is needed for the AWS Load Balancer Controller
         - PolicyName: NodeInstanceELBPolicy
           PolicyDocument:
             Version: '2012-10-17'
@@ -330,17 +293,13 @@ Resources:
   MyEKSCluster:
     Type: AWS::EKS::Cluster
     Properties:
-      Name: my-eks-cluster
+      Name: !Ref EKSClusterName
       Version: 1.29
       RoleArn: !GetAtt EKSMasterRole.Arn
       ResourcesVpcConfig:
         SubnetIds:
           - !Ref PrivateSubnet1
           - !Ref PrivateSubnet2
-        SecurityGroupIds:
-          - !Ref MySecurityGroup
-      AccessConfig:
-        AuthenticationMode: API_AND_CONFIG_MAP
 
   MyNodeGroup:
     Type: AWS::EKS::Nodegroup
