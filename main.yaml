@@ -106,7 +106,7 @@ Resources:
         BlockPublicPolicy: false
         RestrictPublicBuckets: false
 
-  EC2Role:
+  MongoEC2Role:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -116,32 +116,37 @@ Resources:
             Principal:
               Service: ec2.amazonaws.com
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: MongoEC2Policy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: 
-                  - s3:GetObject
-                  - s3:ListBucket
-                Resource:
-                  - !Sub arn:aws:s3:::${DeploymentBucketName}
-                  - !Sub arn:aws:s3:::${DeploymentBucketName}/*
-              - Effect: Allow
-                Action: s3:*
-                Resource:
-                  - !Sub ${BackupBucket.Arn}
-                  - !Sub ${BackupBucket.Arn}/*
-              - Effect: Allow
-                Action: ec2:*
-                Resource: '*'
 
-  EC2InstanceProfile:
+  MongoEC2Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: MongoEC2Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${DeploymentBucketName}
+              - !Sub arn:aws:s3:::${DeploymentBucketName}/*
+          - Effect: Allow
+            Action: s3:*
+            Resource:
+              - !Sub ${BackupBucket.Arn}
+              - !Sub ${BackupBucket.Arn}/*
+          - Effect: Allow
+            Action: ec2:*
+            Resource: '*'
+      Roles:
+        - !Ref MongoEC2Role
+
+  MongoEC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
       Roles:
-        - Ref: EC2Role
+        - Ref: MongoEC2Role
 
   MongoInstance:
     Type: AWS::EC2::Instance
@@ -152,7 +157,7 @@ Resources:
         - !Ref MongoSecurityGroup
       KeyName: !Ref MyKeyPair
       SubnetId: !Ref PublicSubnet
-      IamInstanceProfile: !Ref EC2InstanceProfile
+      IamInstanceProfile: !Ref MongoEC2InstanceProfile
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
@@ -278,17 +283,22 @@ Resources:
         - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
         - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
-      Policies:
-          # This is needed for the AWS Load Balancer Controller
-        - PolicyName: NodeInstanceELBPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - elasticloadbalancing:*
-                  - ec2:*
-                Resource: '*'
+
+  NodeInstanceELBPolicy:
+    # This is needed for the AWS Load Balancer Controller
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: NodeInstanceELBPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:*
+              - ec2:*
+            Resource: '*'
+      Roles:
+        - !Ref NodeInstanceRole
 
   MyEKSCluster:
     Type: AWS::EKS::Cluster
