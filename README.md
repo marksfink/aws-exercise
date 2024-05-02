@@ -67,4 +67,4 @@ Use `kubectl get pods -n kube-system` to wait for the AWS Load Balancer Controll
 kubectl create -f tasky.yaml
 ```
 
-7. Go in the AWS Console, into EC2, Load Balancers.  You should see a load balancer in the process of provisioning (after you deploy tasky above).  This can take several minutes.  Wait for it to become ready/active.  Copy the pubic DNS name of the load balancer into your browser using port 50080 and you should see the Tasky app.
+7. Go in the AWS Console, into EC2, Load Balancers.  You should see a load balancer in the process of provisioning (after you deploy tasky above).  This can take several minutes.  Wait for it to become ready/active.  Copy the public DNS name of the load balancer into your browser using port 50080 and you should see the Tasky app.
