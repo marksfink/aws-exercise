@@ -21,9 +21,10 @@ Parameters:
   MongoPassword:
     Type: String
     Description: Mongo password for tasky and backups
-  YourIPAddress:
+  SSHCidrIp:
     Type: String
-    Description: IP address allowed for SSH traffic.  Be sure to add /32 at the end.
+    Description: CIDR IP to allow SSH access from
+    Default: 0.0.0.0/0
   EKSClusterName:
     Type: String
     Description: EKS Cluster Name
@@ -84,13 +85,13 @@ Resources:
   MongoSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow limited SSH and Mongo from EKS
+      GroupDescription: Allow SSH to the internet and Mongo from EKS
       VpcId: !Ref MyVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
-          CidrIp: !Ref YourIPAddress
+          CidrIp: !Ref SSHCidrIp
         - IpProtocol: tcp
           FromPort: 27017
           ToPort: 27017
